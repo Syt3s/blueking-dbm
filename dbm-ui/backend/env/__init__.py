@@ -109,6 +109,7 @@ CSRF_TRUSTED_ORIGINS = get_type_env(key="CSRF_TRUSTED_ORIGINS", _type=list, defa
 
 # SaaS访问地址，用于用户访问/第三方应用跳转/Iframe/Grafana 等场景
 BK_SAAS_HOST = get_type_env(key="BK_SAAS_HOST", _type=str, default="http://bk-dbm.example.com")
+BK_SAAS_BACKEND_HOST = get_type_env(key="BK_SAAS_BACKEND_HOST", _type=str, default=BK_SAAS_HOST)
 # BK_SAAS_CALLBACK_URL 用于 接口回调/权限中心访问 等场景
 # 通常因证书问题，这里需要使用 http
 BK_SAAS_CALLBACK_URL = get_type_env(key="BK_SAAS_CALLBACK_URL", _type=str, default="") or BK_SAAS_HOST.replace(
