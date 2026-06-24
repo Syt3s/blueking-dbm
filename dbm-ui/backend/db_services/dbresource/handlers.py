@@ -14,9 +14,11 @@ import math
 import time
 from collections import defaultdict
 from datetime import datetime
+from functools import wraps
 from typing import Any, Dict, List
 
 from celery import shared_task
+from django.db import transaction
 from django.utils.translation import gettext as _
 
 from backend import env
@@ -895,34 +897,130 @@ def async_create_replenish(username, bk_biz_id, infos, remark="", record_id=None
     ResourceHandler.create_replenish(username, bk_biz_id, infos, remark, record_id=record_id)
 
 
+def set_replenish_lock_flag(replenish, lock_value):
+    """
+    设置补货记录的 lock 标记。
+    :param replenish: ResourceReplenishRecord 实例（已从数据库获取）
+    :param lock_value: True 或 False
+    """
+    details = replenish.details
+    details["lock"] = lock_value
+    replenish.details = details
+    replenish.save(update_fields=["details"])
+    return replenish
+
+
+def with_replenish_lock(func):
+    @wraps(func)
+    def wrapper(replenish_record_id, *args, **kwargs):
+        with transaction.atomic():
+            replenish = ResourceReplenishRecord.objects.select_for_update().filter(id=replenish_record_id).first()
+            if not replenish:
+                return
+            if replenish.details.get("lock"):
+                return
+            set_replenish_lock_flag(replenish, True)
+
+        try:
+            return func(replenish_record_id, *args, **kwargs)
+        finally:
+            replenish = ResourceReplenishRecord.objects.filter(id=replenish_record_id).first()
+            if replenish and replenish.details.get("lock"):
+                set_replenish_lock_flag(replenish, False)
+                logger.info("clear retry replenish flag for record %s", replenish_record_id)
+
+    return wrapper
+
+
 @shared_task
+@with_replenish_lock
 def async_retry_replenish_tickets(replenish_record_id, username, ticket_ids=None):
+    """
+    异步重试补货任务（自动加解锁）
+    """
     from backend.ticket.flow_manager.inner import HCMReplenishResourceTaskFlow
 
-    # 对补货记录加行锁， 防止多次重试
-    replenish = ResourceReplenishRecord.objects.select_for_update().filter(id=replenish_record_id).first()
-    if not replenish:
-        return
+    try:
+        replenish = ResourceReplenishRecord.objects.filter(id=replenish_record_id).first()
+        if not replenish:
+            return
 
-    # 对传过来的单据id进行过滤
-    retry_ticket_ids = (
-        [ticket_id for ticket_id in replenish.ticket_ids if ticket_id in ticket_ids]
-        if ticket_ids
-        else replenish.ticket_ids
-    )
-    tickets = Ticket.objects.filter(id__in=retry_ticket_ids, status=TicketStatus.FAILED)
-    if not tickets:
-        return
+        retry_ticket_ids = (
+            [tid for tid in replenish.ticket_ids if tid in ticket_ids] if ticket_ids else replenish.ticket_ids
+        )
 
-    error_flows = Flow.objects.filter(ticket__in=tickets, status=TicketFlowStatus.FAILED)
-    for flow in error_flows:
-        if flow.err_code == FlowErrCode.HCM_APPLY_LACK_RESOURCE_ERROR:
-            HCMReplenishResourceTaskFlow(flow).retry()
-        else:
-            flow_handler = TaskFlowHandler(root_id=flow.flow_obj_id)
-            node_ids = flow_handler.get_specific_node_ids(status=StateType.FAILED)
-            for node_id in node_ids:
-                try:
-                    flow_handler.retry_node(node_id, username)
-                except Exception as err:
-                    logger.error("retry replenish ticket node error: {}".format(err))
+        tickets = Ticket.objects.filter(id__in=retry_ticket_ids, status=TicketStatus.FAILED)
+        if not tickets:
+            return
+
+        error_flows = Flow.objects.filter(ticket__in=tickets, status=TicketFlowStatus.FAILED)
+        for flow in error_flows:
+            try:
+                if flow.err_code == FlowErrCode.HCM_APPLY_LACK_RESOURCE_ERROR:
+                    HCMReplenishResourceTaskFlow(flow).retry()
+                else:
+                    flow_handler = TaskFlowHandler(root_id=flow.flow_obj_id)
+                    node_ids = flow_handler.get_specific_node_ids(status=StateType.FAILED)
+                    for node_id in node_ids:
+                        flow_handler.retry_node(node_id, username)
+            except Exception as err:
+                logger.error(f"retry flow {flow.id} for ticket {flow.ticket_id} failed: {err}")
+
+    except Exception as err:
+        logger.error("retry replenish ticket node error: {}".format(err))
+
+
+# @shared_task
+# def async_retry_replenish_tickets(replenish_record_id, username, ticket_ids=None):
+#     from backend.ticket.flow_manager.inner import HCMReplenishResourceTaskFlow
+#
+#     # 对补货记录加行锁， 防止多次重试
+#     with transaction.atomic():
+#         replenish = ResourceReplenishRecord.objects.select_for_update().filter(id=replenish_record_id).first()
+#         if not replenish:
+#             return
+#
+#         if replenish.details.get("lock"):
+#             return
+#
+#         # 对传过来的单据id进行过滤
+#         retry_ticket_ids = (
+#             [ticket_id for ticket_id in replenish.ticket_ids if ticket_id in ticket_ids]
+#             if ticket_ids
+#             else replenish.ticket_ids
+#         )
+#
+#         # 打上标记
+#         details = replenish.details
+#         details["lock"] = True
+#         replenish.details = details
+#         replenish.save(update_fields=["details"])
+#
+#     try:
+#         tickets = Ticket.objects.filter(id__in=retry_ticket_ids, status=TicketStatus.FAILED)
+#         if not tickets:
+#             return
+#
+#         error_flows = Flow.objects.filter(ticket__in=tickets, status=TicketFlowStatus.FAILED)
+#         for flow in error_flows:
+#             try:
+#                 if flow.err_code == FlowErrCode.HCM_APPLY_LACK_RESOURCE_ERROR:
+#                     HCMReplenishResourceTaskFlow(flow).retry()
+#                 else:
+#                     flow_handler = TaskFlowHandler(root_id=flow.flow_obj_id)
+#                     node_ids = flow_handler.get_specific_node_ids(status=StateType.FAILED)
+#                     for node_id in node_ids:
+#                         flow_handler.retry_node(node_id, username)
+#             except Exception as err:
+#                 logger.error(f"retry flow {flow.id} for ticket {flow.ticket_id} failed: {err}")
+#
+#     except Exception as err:
+#         logger.error("retry replenish ticket node error: {}".format(err))
+#     finally:
+#         replenish = ResourceReplenishRecord.objects.filter(id=replenish_record_id).first()
+#         if replenish and replenish.details.get("lock"):
+#             details = replenish.details
+#             details["lock"] = False
+#             replenish.details = details
+#             replenish.save(update_fields=["details"])
+#             logger.info("clear  retry  replenish flag")

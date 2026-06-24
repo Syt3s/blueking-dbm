@@ -213,5 +213,6 @@ class DBReplenishViewSet(viewsets.AuditedModelViewSet):
         params = {"replenish_record_id": data["replenish_record_id"], "username": request.user.username}
         if data.get("ticket_ids"):
             params["ticket_ids"] = data["ticket_ids"]
-        async_retry_replenish_tickets.apply_async(kwargs=params)
+        async_retry_replenish_tickets(**params)
+        # async_retry_replenish_tickets.apply_async(kwargs=params)
         return Response()
