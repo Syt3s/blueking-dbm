@@ -675,6 +675,6 @@ class DBConfigHandler:
 
     @staticmethod
     def _patch_conf_type_namespace(cluster_type: str, conf_type):
-        default_conf_namespace = "cluster_type"
+        default_conf_namespace = cluster_type
         namespace = COMPONENT_CONFIG_NAMESPACE.get(cluster_type, {}).get(conf_type, default_conf_namespace)
         return namespace
